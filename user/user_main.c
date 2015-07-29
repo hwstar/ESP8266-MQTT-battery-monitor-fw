@@ -96,7 +96,7 @@
 #define DEF_SHUNT_AMPS  200
 #define DEF_SHUNT_MV    50
 
-#define ACQUIRE_TIME 1000 // Time between measurements
+#define ACQUIRE_TIME 250 // Time between measurements
 
 // Definition for a patcher config element
 
@@ -188,27 +188,21 @@ LOCAL config_info_block configInfoBlock = {
 	.e[MQTTUSER] = {.key = "MQTTUSER", .value="your_mqtt_client_name_here"}, // MQTT User name
 	.e[MQTTPASS] = {.key = "MQTTPASS", .value="its_a_secret"},// MQTT Password
 	.e[MQTTKPALIV] = {.key = "MQTTKPALIV", .value="120"}, // Keepalive interval
-	.e[MQTTDEVPATH] = {.flags = CONFIG_FLD_REQD, .key = "MQTTDEVPATH", .value = "/home/lab/relay"}, // Device path
-	.e[MQTTBTLOCAL] = {.key = "MQTTBTLOCAL", .value = "1"} // Optional local toggle control using GPIO0
+	.e[MQTTDEVPATH] = {.flags = CONFIG_FLD_REQD, .key = "MQTTDEVPATH", .value = "/home/lab/relay"} // Device path
+
 };
 
 // Command elements 
 // Additional commands are added here
  
-enum {CMD_OFF = 0, CMD_ON, CMD_TOGGLE, CMD_PULSE, CMD_BTLOCAL, CMD_QUERY, CMD_SURVEY, CMD_SSID, CMD_RESTART, CMD_WIFIPASS, CMD_CYCLE};
+enum {CMD_QUERY = 0, CMD_SURVEY, CMD_SSID, CMD_RESTART, CMD_WIFIPASS};
 
 LOCAL command_element commandElements[] = {
-	{.command = "off", .type = CP_NONE},
-	{.command = "on", .type = CP_NONE},
-	{.command = "toggle", .type = CP_NONE},
-	{.command = "pulse", .type = CP_INT},
-	{.command = "btlocal", .type = CP_INT},
 	{.command = "query", .type = CP_NONE},
 	{.command = "survey", .type = CP_NONE},
 	{.command = "ssid", .type = CP_QSTRING},
 	{.command = "restart",.type = CP_NONE},
 	{.command = "wifipass",.type = CP_QSTRING},
-	{.command = "cycle",.type = CP_INT},
 	{.command = ""} /* End marker */
 };
 	
@@ -280,21 +274,6 @@ LOCAL void ICACHE_FLASH_ATTR handleQstringCommand(char *new_value, command_eleme
 	}
 
 	util_free(buf);
-
-}
-
-/**
- * Send MQTT message to update relay state
- */
- 
-LOCAL void ICACHE_FLASH_ATTR updateRelayState(int s)
-{
-	char *state = s ? "\"on\"}" : "\"off\"}";
-	char result[16];
-	os_strcpy(result,"{\"relaystate\":");
-	os_strcat(result, state);
-	INFO("MQTT: New Relay State: %s\r\n", state);
-	MQTT_Publish(&mqttClient, statusTopic, result, os_strlen(result), 0, 0);
 
 }
 
@@ -446,15 +425,6 @@ const char *data, uint32_t data_len)
 			if(CP_NONE == ce->type){ // Parameterless command
 				if(!os_strcmp(command, ce->command)){
 					switch(i){
-						case CMD_OFF:
-							break;
-					
-						case CMD_ON:
-							break;
-					
-						case CMD_TOGGLE:
-							break;
-						
 						case CMD_QUERY:
 							break;
 							
@@ -477,21 +447,6 @@ const char *data, uint32_t data_len)
 				int arg;
 				if(util_parse_command_int(command, ce->command, dataBuf, &arg)){
 					switch(i){
-						case CMD_PULSE: // Pulse rely on then off for a specific time in mSec
-							break;
-			
-						case CMD_BTLOCAL: // Link or break button control from relay
-							ce->p.i = (arg) ? 1: 0;
-							kvstore_update_number(configHandle, ce->command, ce->p.i);
-							break;
-							
-						case CMD_CYCLE: // Cycle relay
-							if(arg && (arg < 500))
-								arg = 500; // Clip to 1/2 sec half cycle
-							arg = arg/100; // Convert 1ms to 100ms count
-							ce->p.i = arg;
-							if(!arg) // If paramter is 0, this is a request to stop cycling.
-							break;
 							
 						default:
 							util_assert(FALSE, "Unsupported command: %d", i);
@@ -800,11 +755,10 @@ LOCAL void ICACHE_FLASH_ATTR sysInit(void)
 
 	const char *ssidKey = commandElements[CMD_SSID].command;
 	const char *WIFIPassKey = commandElements[CMD_WIFIPASS].command;
-	const char *btLocalKey = commandElements[CMD_BTLOCAL].command;
+
 
 	// Check for default configuration overrides
 	if(!kvstore_exists(configHandle, ssidKey)){ // if no ssid, assume the rest of the defaults need to be set as well
-		kvstore_put(configHandle, btLocalKey, configInfoBlock.e[MQTTBTLOCAL].value);
 		kvstore_put(configHandle, ssidKey, configInfoBlock.e[WIFISSID].value);
 		kvstore_put(configHandle, WIFIPassKey, configInfoBlock.e[WIFIPASS].value);
 
@@ -814,8 +768,6 @@ LOCAL void ICACHE_FLASH_ATTR sysInit(void)
 	}
 	
 	// Get the configurations we need from the KVS and store them in the commandElement data area
-	
-	kvstore_get_integer(configHandle, btLocalKey, &commandElements[CMD_BTLOCAL].p.i); // Retrieve button local
 	
 	commandElements[CMD_SSID].p.sp = kvstore_get_string(configHandle, ssidKey); // Retrieve SSID
 	
