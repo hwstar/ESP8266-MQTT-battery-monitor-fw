@@ -83,15 +83,20 @@
 #define INA226_CURRENT  0x04
 #define INA226_CAL      0x05
 
-// INA226 Initial Constants 
-#define INA226_INIT_CONFIG 0x0927
+// INA226 Constants 
+#define INA226_INIT_CONFIG 0x4927 // 128 averages, 1.1ms conversion time, shunt and bus continuous
+
 
 // Misc constants 
 #define VOLTRES 1250       // Microvolt per bit
-#define VMAG -6
+#define VMAG -6			   
 #define CMAG -7
 #define PMAG -3
 
+#define DEF_SHUNT_AMPS  200
+#define DEF_SHUNT_MV    50
+
+#define ACQUIRE_TIME 1000 // Time between measurements
 
 // Definition for a patcher config element
 
@@ -139,10 +144,19 @@ typedef struct {
 	uint8_t buffer[24];
 } i2c_t;
 
+typedef struct {
+	uint32_t current_lsb; // Current LSB in 10E-7 amps
+	uint32_t power_lsb;
+	uint16_t cal_value;  
+	uint16_t voltage;
+	int16_t current;
+	uint16_t power;
+}ina226_t;
+
 typedef struct config_info_block_tag config_info_block;
 
 // I2C states
-enum {I2CS_STARTUP = 0};
+enum {I2CS_STARTUP = 0, I2CS_ACQUIRE};
 
 // Definition of command codes and types
 
@@ -206,6 +220,7 @@ LOCAL char *infoTopic = "/node/info";
 LOCAL flash_handle_s *configHandle;
 LOCAL os_timer_t mainTimer, i2cTimer;
 LOCAL i2c_t i2c;
+LOCAL ina226_t ina226;
 
 MQTT_Client mqttClient;			// Control block used by MQTT functions
 
@@ -502,8 +517,10 @@ const char *data, uint32_t data_len)
 	util_free(dataBuf);
 }
 
-// Read bytes from an I2C device
-
+/**
+ * Read bytes from an I2C device
+ */
+ 
 LOCAL void ICACHE_FLASH_ATTR  i2c_read_bytes(uint8_t len)
 {
 	uint8_t i;
@@ -517,7 +534,9 @@ LOCAL void ICACHE_FLASH_ATTR  i2c_read_bytes(uint8_t len)
 }
 
 
-// I2c one shot timer arm
+/**
+ * I2c one shot timer arm
+ */
 
 LOCAL void ICACHE_FLASH_ATTR i2c_timer_arm( uint16_t delay)
 {
@@ -527,16 +546,17 @@ LOCAL void ICACHE_FLASH_ATTR i2c_timer_arm( uint16_t delay)
 }
 
 
-/*
+/**
  * Place unsigned integer into buffer in big endian format
  */
+ 
 LOCAL void ICACHE_FLASH_ATTR u16_to_bebytes(uint16_t val, uint8_t *bytes)
 {
 	bytes[0] = (uint8_t) (val >> 8);
 	bytes[1] = (uint8_t) (val & 0xFF);
 }
 
-/*
+/**
  * Extract a big endian unsigned integer from a buffer
  */
   
@@ -547,7 +567,29 @@ LOCAL uint16_t ICACHE_FLASH_ATTR bebytes_to_u16(uint8_t *bytes)
 	return val;
 }
 
-/*
+
+
+/**
+ * Calculate the shunt calibration value from the amperage rating of 
+ * the shunt, and the shunt drop at 100% current rating.
+ * Set the ina226 data structure control block fields
+ */
+ 
+LOCAL void calc_ina226_cal(uint16_t shunt_amps, uint16_t shunt_mv, ina226_t *cb)
+{
+    uint64_t a107, rs107;
+
+    a107 = 10000000 * shunt_amps;
+    rs107 = (shunt_mv * (10000000 / 1000)) / shunt_amps;
+
+    cb->current_lsb = (uint32_t) (a107 >> 15);
+	cb->power_lsb = 25 * cb->current_lsb;
+    cb->cal_value = (uint16_t) ((512000000) / ((cb->current_lsb * rs107 ) / 1000));
+}
+
+
+
+/**
  * Generic I2C read 
  */
 
@@ -576,7 +618,7 @@ LOCAL int ICACHE_FLASH_ATTR  i2c_generic_read(uint8_t addr, uint8_t length)
 	return TRUE;
 }
 
-/*
+/**
  * Write something to an I2C device
  */
 
@@ -627,28 +669,95 @@ LOCAL int ICACHE_FLASH_ATTR i2c_write(uint8_t command, uint8_t addr, uint16_t wa
 	return TRUE;
 }
 
-/*
- * Simplified i2c request function. (Address + command only)
+/**
+ * INA226 i2c request function. (Address + command only)
  */
  
-LOCAL int ICACHE_FLASH_ATTR i2c_request(uint8_t command, uint8_t addr, uint16_t wait_time)
+LOCAL int ICACHE_FLASH_ATTR i2c_ina226_request(uint8_t command, uint8_t addr, uint16_t wait_time)
 {
 	return i2c_write(command, addr, wait_time, NULL, 0);
 }
 
+/**
+ * Write 16 bit unsigned value to an ina226 register
+ */
 
-// I2C handler
+LOCAL int ICACHE_FLASH_ATTR i2c_ina226_write(uint8_t command, uint8_t addr, uint16_t wait_time, uint16_t val)
+{
+	uint8_t bytes[2];
+	
+	u16_to_bebytes(val, bytes);
+	return i2c_write(command, addr, wait_time, bytes, sizeof(uint16_t));
+}
+
+/**
+ * Return the contents of an ina226 register
+ */
+
+LOCAL int ICACHE_FLASH_ATTR i2c_ina226_read(uint8_t addr, uint16_t *val)
+{
+	int res;
+	
+	if((res = i2c_generic_read(addr, sizeof(uint16_t))) == TRUE){
+		*val = bebytes_to_u16(i2c.buffer);
+	}
+	return res;
+}
+
+
+
+/**
+ *  I2C handler
+ */
 
 LOCAL int ICACHE_FLASH_ATTR  i2c_handler(void *arg)
 {
+	uint16_t res;
 	switch(i2c.state){
 		case I2CS_STARTUP:
 			// Request a config from the INA226
-			i2c_request(INA226_CONFIG, INA226_ADDR, 0);
+			i2c_ina226_write(INA226_CONFIG, INA226_ADDR, 0, INA226_INIT_CONFIG);
+			// Read it back
+			i2c_ina226_read(INA226_ADDR, &res);
+			if(res != INA226_INIT_CONFIG){
+				INFO("Error. Bad config register read: %04X\n", res);
+				return;
+			}	
+			calc_ina226_cal(100, 100, &ina226);
+			INFO("Current lsb: %08X\n", ina226.current_lsb);
+			INFO("Power lsb: %08X\n", ina226.power_lsb);
+			INFO("Calibration value: %04X\n", ina226.cal_value);
+			// Write the calibration value to the ina226 calibration register
+			i2c_ina226_write(INA226_CAL, INA226_ADDR, 0, ina226.cal_value);
+			// Read it back
+			i2c_ina226_read(INA226_ADDR, &res);
+			if(res != ina226.cal_value){
+				INFO("Error. Bad cal register read is: %04X s/b: %04X\n", res, ina226.cal_value);
+				return;
+			}	
+			// We are now ready to start aquiring voltage, current and power
+			// Advance to the acquire state and. Set a timer to do
+			// do it periodically
+			i2c.state = I2CS_ACQUIRE;
+			i2c_timer_arm(ACQUIRE_TIME);
+			break;
 			
-			i2c_generic_read(INA226_ADDR, 2);
-			uint16_t val = bebytes_to_u16(i2c.buffer);
-			INFO("INA226 Config: %04X\n", val);
+		case I2CS_ACQUIRE:
+			// Read volts from bus
+			i2c_ina226_request(INA226_BUS, INA226_ADDR, 0);
+			i2c_ina226_read(INA226_ADDR, &ina226.voltage);
+			// Read current
+			i2c_ina226_request(INA226_CURRENT, INA226_ADDR, 0);
+			uint16_t c;
+			i2c_ina226_read(INA226_ADDR, &c);
+			ina226.current = (int16_t) c;
+			// Read calculated power
+			i2c_ina226_request(INA226_POWER, INA226_ADDR, 0);
+			i2c_ina226_read(INA226_ADDR, &ina226.power);
+			INFO("Voltage: %u\n",  (uint32_t) (((uint64_t) ina226.voltage) * 125)/100);
+			INFO("Current: %d\n",(int32_t) (ina226.current * (int64_t) ina226.current_lsb)/10000);
+			INFO("Power: %u\n", (uint32_t) (ina226.power * (uint64_t) ina226.power_lsb/10000));
+			i2c_timer_arm(ACQUIRE_TIME);
 			break;
 			
 				
@@ -656,7 +765,6 @@ LOCAL int ICACHE_FLASH_ATTR  i2c_handler(void *arg)
 			break;
 	}		
 }
-
 
 /**
  * System initialization
