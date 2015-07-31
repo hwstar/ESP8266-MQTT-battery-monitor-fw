@@ -125,7 +125,7 @@ kvstore_get_integer(flash_handle_s *h, const char *key, int *int_var)
 	char *dup, *v;
 	
 	v = kvstoreGet(h, key);
-	INFO("KVS Value: %s\r\n", v);
+	//INFO("KVS Value: %s\r\n", v);
 	
 	if(!v){
 		return FALSE;

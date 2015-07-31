@@ -65,6 +65,8 @@
 #define INFO_BLOCK_SIG "ESP8266HWSTARSR"// Patcher pattern
 #define CONFIG_FLD_REQD 0x01			// Patcher field required flag
 
+#define DEF_SHUNT_AMPS  "100"			// Full scale shunt amps
+#define DEF_SHUNT_MV    "100"			// Full scale shunt voltage
 
 #define I2C_ADDR_BYTE(x,y) ((x) << 1) | ((y) & 1)
 #define I2C_READ 1
@@ -89,12 +91,7 @@
 
 // Misc constants 
 #define VOLTRES 1250       // Microvolt per bit
-#define VMAG -6			   
-#define CMAG -7
-#define PMAG -3
 
-#define DEF_SHUNT_AMPS  200
-#define DEF_SHUNT_MV    50
 
 #define ACQUIRE_TIME 250 // Time between measurements
 
@@ -147,7 +144,9 @@ typedef struct {
 typedef struct {
 	uint32_t current_lsb; // Current LSB in 10E-7 amps
 	uint32_t power_lsb;
-	uint16_t cal_value;  
+	uint16_t cal_value; 
+	uint16_t shunt_amps;
+	uint16_t shunt_mv; 
 	uint16_t voltage;
 	int16_t current;
 	uint16_t power;
@@ -195,7 +194,7 @@ LOCAL config_info_block configInfoBlock = {
 // Command elements 
 // Additional commands are added here
  
-enum {CMD_QUERY = 0, CMD_SURVEY, CMD_SSID, CMD_RESTART, CMD_WIFIPASS};
+enum {CMD_QUERY = 0, CMD_SURVEY, CMD_SSID, CMD_RESTART, CMD_WIFIPASS, CMD_SHUNTAMPS, CMD_SHUNTMV};
 
 LOCAL command_element commandElements[] = {
 	{.command = "query", .type = CP_NONE},
@@ -203,6 +202,8 @@ LOCAL command_element commandElements[] = {
 	{.command = "ssid", .type = CP_QSTRING},
 	{.command = "restart",.type = CP_NONE},
 	{.command = "wifipass",.type = CP_QSTRING},
+	{.command = "shuntamps",.type = CP_QSTRING},
+	{.command = "shuntmv",.type = CP_QSTRING},
 	{.command = ""} /* End marker */
 };
 	
@@ -254,17 +255,19 @@ LOCAL void ICACHE_FLASH_ATTR publishConnInfo(MQTT_Client *client)
  * Handle qstring command
  */
  
-LOCAL void ICACHE_FLASH_ATTR handleQstringCommand(char *new_value, command_element *ce)
+LOCAL int ICACHE_FLASH_ATTR handleQstringCommand(char *new_value, command_element *ce)
 {
 	char *buf = util_zalloc(128);
 	
-	
+
 	if(!new_value){
 		const char *cur_value = kvstore_get_string(configHandle, ce->command);
 		os_sprintf(buf, "{\"%s\":\"%s\"}", ce->command, cur_value);
 		util_free(cur_value);
 		INFO("Query Result: %s\r\n", buf );
 		MQTT_Publish(&mqttClient, statusTopic, buf, os_strlen(buf), 0, 0);
+		util_free(buf);
+		return FALSE;
 	}
 	else{
 		util_free(ce->p.sp); // Free old value
@@ -274,7 +277,7 @@ LOCAL void ICACHE_FLASH_ATTR handleQstringCommand(char *new_value, command_eleme
 	}
 
 	util_free(buf);
-
+	return TRUE;
 }
 
 /**
@@ -378,6 +381,26 @@ LOCAL void ICACHE_FLASH_ATTR mqttPublishedCb(uint32_t *args)
 	INFO("MQTT: Published\r\n");
 }
 
+
+/**
+ * Calculate the shunt calibration value from the amperage rating of 
+ * the shunt, and the shunt drop at 100% current rating.
+ * Set the ina226 data structure control block fields
+ */
+ 
+LOCAL void calc_ina226_cal(uint16_t new_shunt_amps, uint16_t new_shunt_mv, ina226_t *cb)
+{
+    uint64_t a107, rs107;
+
+    a107 = 10000000 * new_shunt_amps;
+    rs107 = (new_shunt_mv * (10000000 / 1000)) / new_shunt_amps;
+
+    cb->current_lsb = (uint32_t) (a107 >> 15);
+	cb->power_lsb = 25 * cb->current_lsb;
+    cb->cal_value = (uint16_t) ((512000000) / ((cb->current_lsb * rs107 ) / 1000));
+}
+
+
 /**
  * MQTT Data call back
  * Commands are decoded and acted upon here
@@ -387,7 +410,7 @@ LOCAL void ICACHE_FLASH_ATTR
 mqttDataCb(uint32_t *args, const char* topic, uint32_t topic_len, 
 const char *data, uint32_t data_len)
 {
-	char *topicBuf, *dataBuf;
+	char *topicBuf, *dataBuf, *buf;
 	uint8_t i;
 	struct jsonparse_state state;
 	char command[32];
@@ -399,6 +422,8 @@ const char *data, uint32_t data_len)
 	// Save local copies of the topic and data
 	topicBuf = util_strndup(topic, topic_len);
 	dataBuf = util_strndup(data, data_len);
+	buf = (char *) os_zalloc(128);
+	
 	
 	INFO("Receive topic: %s, data: %s \r\n", topicBuf, dataBuf);
 	
@@ -406,7 +431,7 @@ const char *data, uint32_t data_len)
 	if(!os_strcmp(topicBuf, controlTopic)){
 		jsonparse_setup(&state, dataBuf, data_len);
 		if (util_parse_json_param(&state, "control", command, sizeof(command)) != 2)
-			return; /* Command not present in json object */
+			goto cleanup; /* Control field not present in json object */
 		if(!os_strcmp(command, "muster")){
 			publishConnInfo(&mqttClient);
 		}
@@ -417,7 +442,7 @@ const char *data, uint32_t data_len)
 		// Parse command
 		jsonparse_setup(&state, dataBuf, data_len);
 		if (util_parse_json_param(&state, "command", command, sizeof(command)) != 2)
-			return; /* Command not present in json object */
+			goto cleanup; /* Command not present in json object */
 				
 		for(i = 0; commandElements[i].command[0]; i++){
 			command_element *ce = &commandElements[i];
@@ -426,13 +451,23 @@ const char *data, uint32_t data_len)
 				if(!os_strcmp(command, ce->command)){
 					switch(i){
 						case CMD_QUERY:
+							// Return voltage in millivolts, 
+							// current in milliamps,
+							// and power in milliwatts
+							os_sprintf(buf, "{\"voltage\": \"%u\"},{\"current\": \"%d\"},{\"power\": \"%u\"}",
+							(uint32_t) (((uint64_t) ina226.voltage) * 125)/100,
+							(int32_t) (ina226.current * (int64_t) ina226.current_lsb)/10000,
+							(uint32_t) (ina226.power * (uint64_t) ina226.power_lsb)/10000);
+							MQTT_Publish(&mqttClient, statusTopic, buf, os_strlen(buf), 0, 0);
 							break;
 							
 						case CMD_SURVEY:
+							// Return WIFI survey data
 							wifi_station_scan(NULL, surveyCompleteCb);
 							break;
 							
 						case CMD_RESTART:
+							// Restart the firmware
 							util_restart();
 							break;
 							
@@ -446,8 +481,7 @@ const char *data, uint32_t data_len)
 			if((CP_INT == ce->type) || (CP_BOOL == ce->type)){ // Integer/bool parameter
 				int arg;
 				if(util_parse_command_int(command, ce->command, dataBuf, &arg)){
-					switch(i){
-							
+					switch(i){								
 						default:
 							util_assert(FALSE, "Unsupported command: %d", i);
 						}
@@ -460,6 +494,15 @@ const char *data, uint32_t data_len)
 					if((CMD_SSID == i) || (CMD_WIFIPASS == i)){ // SSID or WIFIPASS?
 						handleQstringCommand(val, ce);
 					}
+					// Read/set shunt amps. Must be reset to take effect
+					if(CMD_SHUNTAMPS == i){
+						handleQstringCommand(val, ce);
+					
+					}
+					// Read/set shunt millivolts. Must be reset to take effect
+					if(CMD_SHUNTMV == i){
+						handleQstringCommand(val, ce);
+					}
 				}
 			}
 			
@@ -468,8 +511,11 @@ const char *data, uint32_t data_len)
 	} /* END if topic test */
 				
 	// Free local copies of the topic and data strings
+	
+cleanup:	
 	util_free(topicBuf);
 	util_free(dataBuf);
+	util_free(buf);
 }
 
 /**
@@ -520,26 +566,6 @@ LOCAL uint16_t ICACHE_FLASH_ATTR bebytes_to_u16(uint8_t *bytes)
 	int val = ((uint16_t) bytes[0]) << 8;
 	val += bytes[1];
 	return val;
-}
-
-
-
-/**
- * Calculate the shunt calibration value from the amperage rating of 
- * the shunt, and the shunt drop at 100% current rating.
- * Set the ina226 data structure control block fields
- */
- 
-LOCAL void calc_ina226_cal(uint16_t shunt_amps, uint16_t shunt_mv, ina226_t *cb)
-{
-    uint64_t a107, rs107;
-
-    a107 = 10000000 * shunt_amps;
-    rs107 = (shunt_mv * (10000000 / 1000)) / shunt_amps;
-
-    cb->current_lsb = (uint32_t) (a107 >> 15);
-	cb->power_lsb = 25 * cb->current_lsb;
-    cb->cal_value = (uint16_t) ((512000000) / ((cb->current_lsb * rs107 ) / 1000));
 }
 
 
@@ -678,7 +704,7 @@ LOCAL int ICACHE_FLASH_ATTR  i2c_handler(void *arg)
 				INFO("Error. Bad config register read: %04X\n", res);
 				return;
 			}	
-			calc_ina226_cal(100, 100, &ina226);
+			calc_ina226_cal(ina226.shunt_amps, ina226.shunt_mv, &ina226);
 			INFO("Current lsb: %08X\n", ina226.current_lsb);
 			INFO("Power lsb: %08X\n", ina226.power_lsb);
 			INFO("Calibration value: %04X\n", ina226.cal_value);
@@ -709,9 +735,9 @@ LOCAL int ICACHE_FLASH_ATTR  i2c_handler(void *arg)
 			// Read calculated power
 			i2c_ina226_request(INA226_POWER, INA226_ADDR, 0);
 			i2c_ina226_read(INA226_ADDR, &ina226.power);
-			INFO("Voltage: %u\n",  (uint32_t) (((uint64_t) ina226.voltage) * 125)/100);
-			INFO("Current: %d\n",(int32_t) (ina226.current * (int64_t) ina226.current_lsb)/10000);
-			INFO("Power: %u\n", (uint32_t) (ina226.power * (uint64_t) ina226.power_lsb/10000));
+			//INFO("Voltage: %u\n",  (uint32_t) (((uint64_t) ina226.voltage) * 125)/100);
+			//INFO("Current: %d\n",(int32_t) (ina226.current * (int64_t) ina226.current_lsb)/10000);
+			//INFO("Power: %u\n", (uint32_t) (ina226.power * (uint64_t) ina226.power_lsb/10000));
 			i2c_timer_arm(ACQUIRE_TIME);
 			break;
 			
@@ -730,6 +756,7 @@ LOCAL void ICACHE_FLASH_ATTR sysInit(void)
 {
 
 	char *buf = util_zalloc(256); // Working buffer
+	int res;
 	
 	
 	// I/O system initialization
@@ -761,6 +788,8 @@ LOCAL void ICACHE_FLASH_ATTR sysInit(void)
 	if(!kvstore_exists(configHandle, ssidKey)){ // if no ssid, assume the rest of the defaults need to be set as well
 		kvstore_put(configHandle, ssidKey, configInfoBlock.e[WIFISSID].value);
 		kvstore_put(configHandle, WIFIPassKey, configInfoBlock.e[WIFIPASS].value);
+		kvstore_put(configHandle, commandElements[CMD_SHUNTAMPS].command, DEF_SHUNT_AMPS);
+		kvstore_put(configHandle, commandElements[CMD_SHUNTMV].command, DEF_SHUNT_MV);
 
 		// Write the KVS back out to flash	
 	
@@ -772,7 +801,15 @@ LOCAL void ICACHE_FLASH_ATTR sysInit(void)
 	commandElements[CMD_SSID].p.sp = kvstore_get_string(configHandle, ssidKey); // Retrieve SSID
 	
 	commandElements[CMD_WIFIPASS].p.sp = kvstore_get_string(configHandle, WIFIPassKey); // Retrieve WIFI Pass
-
+	
+	// Retrieve the shunt configuration
+	
+	kvstore_get_integer(configHandle, commandElements[CMD_SHUNTAMPS].command, &res);
+	ina226.shunt_amps = (uint16_t) res;
+	kvstore_get_integer(configHandle, commandElements[CMD_SHUNTMV].command, &res);
+	ina226.shunt_mv = (uint16_t) res;
+	INFO("Shunt configured for %d amps\n", ina226.shunt_amps);
+	INFO("Shunt configured for %d millivolts\n", ina226.shunt_mv);
 	
 	// Initialize MQTT connection 
 	
