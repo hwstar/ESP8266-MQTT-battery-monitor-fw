@@ -209,6 +209,7 @@ LOCAL command_element commandElements[] = {
 	
 // Misc Local variables 
 
+LOCAL char *schema = "hwstar_battmon";
 LOCAL char *commandTopic, *statusTopic;
 LOCAL char *controlTopic = "/node/control";
 LOCAL char *infoTopic = "/node/info";
@@ -231,12 +232,13 @@ LOCAL void ICACHE_FLASH_ATTR publishConnInfo(MQTT_Client *client)
 		
 	// Publish who we are and where we live
 	wifi_get_ip_info(STATION_IF, &ipConfig);
-	os_sprintf(buf, "{\"muster\":{\"connstate\":\"online\",\"device\":\"%s\",\"ip4\":\"%d.%d.%d.%d\",\"schema\":\"hwstar_battnode\",\"ssid\":\"%s\"}}",
+	os_sprintf(buf, "{\"muster\":{\"connstate\":\"online\",\"device\":\"%s\",\"ip4\":\"%d.%d.%d.%d\",\"schema\":\"%s\",\"ssid\":\"%s\"}}",
 			configInfoBlock.e[MQTTDEVPATH].value,
 			*((uint8_t *) &ipConfig.ip.addr),
 			*((uint8_t *) &ipConfig.ip.addr + 1),
 			*((uint8_t *) &ipConfig.ip.addr + 2),
 			*((uint8_t *) &ipConfig.ip.addr + 3),
+			schema,
 			commandElements[CMD_SSID].p.sp);
 
 	INFO("MQTT Node info: %s\r\n", buf);
