@@ -260,26 +260,25 @@ LOCAL void ICACHE_FLASH_ATTR publishConnInfo(MQTT_Client *client)
 LOCAL int ICACHE_FLASH_ATTR handleQstringCommand(char *new_value, command_element *ce)
 {
 	char *buf = util_zalloc(128);
+	const char *cur_value;
+	uint8_t res = FALSE;
 	
 
-	if(!new_value){
-		const char *cur_value = kvstore_get_string(configHandle, ce->command);
-		os_sprintf(buf, "{\"%s\":\"%s\"}", ce->command, cur_value);
-		util_free(cur_value);
-		INFO("Query Result: %s\r\n", buf );
-		MQTT_Publish(&mqttClient, statusTopic, buf, os_strlen(buf), 0, 0);
-		util_free(buf);
-		return FALSE;
-	}
-	else{
+	if(new_value)
+	{
 		util_free(ce->p.sp); // Free old value
 		ce->p.sp = new_value; // Save reference to new value
 		kvstore_put(configHandle, ce->command, ce->p.sp);
+		res = TRUE;
 		
 	}
-
+	cur_value = kvstore_get_string(configHandle, ce->command);
+	os_sprintf(buf, "{\"%s\":\"%s\"}", ce->command, cur_value);
+	util_free(cur_value);
+	INFO("Query Result: %s\r\n", buf );
+	MQTT_Publish(&mqttClient, statusTopic, buf, os_strlen(buf), 0, 0);
 	util_free(buf);
-	return TRUE;
+	return res;
 }
 
 /**
@@ -456,7 +455,7 @@ const char *data, uint32_t data_len)
 							// Return voltage in millivolts, 
 							// current in milliamps,
 							// and power in milliwatts
-							os_sprintf(buf, "{\"voltage\": \"%u\"},{\"current\": \"%d\"},{\"power\": \"%u\"}",
+							os_sprintf(buf, "{\"voltage\":\"%u\",\"current\":\"%d\",\"power\":\"%u\"}",
 							(uint32_t) (((uint64_t) ina226.voltage) * 125)/100,
 							(int32_t) (ina226.current * (int64_t) ina226.current_lsb)/10000,
 							(uint32_t) (ina226.power * (uint64_t) ina226.power_lsb)/10000);
