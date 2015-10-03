@@ -8,7 +8,7 @@ Allows a 12V battery to be monitored via WIFI. Code is compiled using the toolch
 * Monitor Voltage, Current (charge and discharge), and Power
 * Programmable shunt current and voltage.
 
-** Hardware Project **
+**Hardware Project**
 
 A schematic and printed circuit board design  for this firmware is located in [here](https://github.com/hwstar/ESP8266-MQTT-battery-monitor-hw)
 
